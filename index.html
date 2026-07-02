@@ -793,6 +793,30 @@
     color: var(--text);
   }
 
+  .overall-progress {
+    margin-bottom: 14px;
+  }
+  .overall-progress-track {
+    width: 100%;
+    height: 6px;
+    background: #1A222B;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .overall-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--blue), var(--green));
+    border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+  .overall-progress-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: clamp(8.5px, 2.2vw, 9.5px);
+    color: var(--text-dim);
+    margin-top: 4px;
+    text-align: right;
+  }
+
   .name-gate {
     display: flex;
     flex-direction: column;
@@ -828,6 +852,24 @@
     cursor: pointer;
     min-height: 44px;
   }
+  .name-gate button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .name-gate button.secondary-btn {
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--text-dim);
+  }
+  .name-gate-hint {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: var(--text-dim);
+    max-width: 320px;
+    line-height: 1.5;
+    margin-top: 4px;
+    margin-bottom: 4px;
+  }
 
   .debug-note {
     text-align: center;
@@ -852,6 +894,138 @@ const METER_DEFS = [
   { key: "quality", label: "Quality" },
   { key: "risk", label: "Risk" }, // inverted: high = bad
 ];
+
+// ============================================================
+// CLOUD SAVE / RESUME — Supabase-backed progress persistence.
+// Students identify themselves with name + PIN (studentKey), which lets
+// progress follow them across devices, since a plain iframe embed in the
+// LMS gives no student identity to the page on its own.
+// ============================================================
+const SUPABASE_URL = "https://xdwhhqygiyjbexinrgal.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhkd2hocXlnaXlqYmV4aW5yZ2FsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NDQxNDMsImV4cCI6MjA5ODUyMDE0M30.BWts3AmPDVbJmpOY_5AwOo0ZJ4YRURcd3tPOKoFwdZs";
+const SUPABASE_TABLE = "byoa_progress";
+
+let studentKey = null; // set once the student enters name+PIN
+let cloudSaveInFlight = false; // prevents overlapping save requests
+let cloudSaveQueued = false;   // if a save comes in while one's in flight, queue one more
+
+function makeStudentKey(name, pin) {
+  const cleanName = (name || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  const cleanPin = (pin || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  return `${cleanName}-${cleanPin}`;
+}
+
+function serializeGameState() {
+  return {
+    playerName,
+    state,
+    currentBeatId,
+    history,
+    decisionLog,
+    formSubmissions,
+  };
+}
+
+function applyLoadedGameState(saved) {
+  if (!saved) return;
+  playerName = saved.playerName || playerName;
+  state = saved.state || { ...START_STATE };
+  currentBeatId = saved.currentBeatId || "N_F1";
+  history = saved.history || [];
+  decisionLog = saved.decisionLog || [];
+  formSubmissions = saved.formSubmissions || {};
+  // transient UI state always starts closed/false regardless of save
+  reviewMode = false;
+  portfolioMode = false;
+  activeFormBeatId = null;
+  activeFormTableRows = {};
+  activeFormFieldValues = {};
+}
+
+// Fetches saved progress for a student key. Returns the parsed game_state
+// object, or null if no save exists yet (new student) or on any error
+// (network issue, RLS misconfiguration, etc — fails safe into "start fresh"
+// rather than blocking the student from playing).
+async function loadCloudProgress(key) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 4000); // don't hang the start screen indefinitely on a slow/unreachable connection
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?student_key=eq.${encodeURIComponent(key)}&select=game_state`,
+      {
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (!rows || rows.length === 0) return null;
+    return rows[0].game_state || null;
+  } catch (err) {
+    console.warn("Cloud progress load failed or timed out, starting fresh:", err);
+    return null;
+  }
+}
+
+// Upserts current progress under the student's key. Fire-and-forget from
+// the caller's perspective — gameplay never waits on this. If a save is
+// already in flight when another is requested, one more save is queued
+// (not stacked infinitely) so rapid clicking doesn't spam requests.
+async function saveCloudProgress() {
+  if (!studentKey) return;
+  if (cloudSaveInFlight) {
+    cloudSaveQueued = true;
+    return;
+  }
+  cloudSaveInFlight = true;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+      },
+      body: JSON.stringify({
+        student_key: studentKey,
+        player_name: playerName,
+        game_state: serializeGameState(),
+        updated_at: new Date().toISOString(),
+      }),
+    });
+  } catch (err) {
+    console.warn("Cloud save failed (progress kept locally in this session):", err);
+  } finally {
+    cloudSaveInFlight = false;
+    if (cloudSaveQueued) {
+      cloudSaveQueued = false;
+      saveCloudProgress();
+    }
+  }
+}
+
+async function deleteCloudProgress() {
+  if (!studentKey) return;
+  try {
+    await fetch(
+      `${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?student_key=eq.${encodeURIComponent(studentKey)}`,
+      {
+        method: "DELETE",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+      }
+    );
+  } catch (err) {
+    console.warn("Cloud delete failed:", err);
+  }
+}
 
 const START_STATE = { budget: 70, schedule: 70, trust: 70, quality: 70, risk: 30 };
 
@@ -3560,7 +3734,7 @@ ${n} does what's possible in the time available, and accepts, with the particula
   },
   C1: {
     focusArea: "Closing", domains: ["Governance"], title: "Close Project or Phase: Final Commissioning",
-    phase: "Check",
+    phase: "Close",
     branchByTier: true,
     variants: {
       thriving: {
@@ -4346,15 +4520,17 @@ function pickChoice(choice, beatId, tier, choiceIndex) {
   decisionLog.push({ beatId, tier, choiceIndex });
   currentBeatId = choice.next;
   render();
+  saveCloudProgress();
 }
 
 function advanceNarrative(beatId, nextId) {
   history.push(beatId);
   currentBeatId = nextId;
   render();
+  saveCloudProgress();
 }
 
-function restart() {
+async function restart() {
   state = { ...START_STATE };
   currentBeatId = "N_F1";
   history = [];
@@ -4366,6 +4542,8 @@ function restart() {
   activeFormTableRows = {};
   activeFormFieldValues = {};
   render();
+  await deleteCloudProgress();
+  saveCloudProgress();
 }
 
 function meterBarHTML() {
@@ -4394,6 +4572,59 @@ function breadcrumbHTML(currentPhase) {
     if (i === idx) cls += " active";
     return `<div class="${cls}">${phase}</div>`;
   }).join("") + `</div>`;
+}
+
+// Real beat counts per phase (Feasibility 24, Design 87, Build 46, Check 31,
+// Transfer 11, Close 3 — 202 total). Used as fixed weights so the overall
+// progress bar's fill speed matches actual content density instead of
+// treating every phase as equal-sized. A single flat "beats visited out of
+// 202" number would also work, but weighting by phase means the bar still
+// reads sensibly even though branching means no single playthrough visits
+// every beat — progress within the CURRENT phase is what's actually known
+// with certainty, and prior phases are counted as fully complete once left.
+const PHASE_BEAT_WEIGHTS = {
+  "Feasibility": 24, "Design": 87, "Build": 46,
+  "Check": 31, "Transfer": 11, "Close": 3,
+};
+const TOTAL_BEAT_WEIGHT = Object.values(PHASE_BEAT_WEIGHTS).reduce((a, b) => a + b, 0);
+
+function overallProgressPercent(currentPhase) {
+  const idx = PHASE_ORDER.indexOf(currentPhase);
+  if (idx === -1) return 0;
+
+  // Sum of weights for every phase fully completed (all phases before the current one)
+  let completedWeight = 0;
+  for (let i = 0; i < idx; i++) {
+    completedWeight += PHASE_BEAT_WEIGHTS[PHASE_ORDER[i]];
+  }
+
+  // Fractional progress through the CURRENT phase, estimated from how many
+  // beats in `history` belong to this phase vs. this phase's total weight.
+  // Capped at 95% of the phase's own weight so the bar never claims a phase
+  // is fully done until the player actually leaves it (avoids a bar that
+  // reads 100% while still showing content from that phase).
+  const beatsInCurrentPhase = history.filter(bid => {
+    const b = BEATS[bid];
+    return b && b.phase === currentPhase;
+  }).length;
+  const phaseWeight = PHASE_BEAT_WEIGHTS[currentPhase] || 1;
+  const phaseFraction = Math.min(0.95, beatsInCurrentPhase / phaseWeight);
+  const currentPhaseContribution = phaseFraction * phaseWeight;
+
+  const percent = ((completedWeight + currentPhaseContribution) / TOTAL_BEAT_WEIGHT) * 100;
+  return Math.max(1, Math.min(99, Math.round(percent))); // never show a bare 0% or a premature 100%
+}
+
+function overallProgressBarHTML(currentPhase) {
+  const pct = overallProgressPercent(currentPhase);
+  return `
+    <div class="overall-progress">
+      <div class="overall-progress-track">
+        <div class="overall-progress-fill" style="width: ${pct}%"></div>
+      </div>
+      <div class="overall-progress-label">${pct}% through the course</div>
+    </div>
+  `;
 }
 
 // Beat/tier keys with a real generated image available in /images.
@@ -5380,6 +5611,7 @@ function submitForm(beatId) {
   activeFormTableRows = {};
   activeFormFieldValues = {};
   render();
+  saveCloudProgress();
 }
 
 function formFeedbackCardHTML(submission) {
@@ -5498,11 +5730,15 @@ function renderBeat() {
         <h1>BYOA: Predictive Track</h1>
         <p>Build Your Own Adventure<br>Drone Manufacturing Facility Buildout</p>
         <input id="nameInput" type="text" placeholder="Enter your name" maxlength="24" />
+        <input id="pinInput" type="text" placeholder="Set a short PIN (e.g. 4 digits)" maxlength="12" />
+        <p class="name-gate-hint">Your name + PIN let you pick up where you left off on any device. Remember both — there's no recovery if you forget your PIN.</p>
         <br>
-        <button onclick="startGame()">Begin</button>
+        <button id="beginBtn" onclick="startGame()">Begin</button>
+        <div id="loadingNote" class="name-gate-hint" style="display:none;">Checking for saved progress…</div>
       </div>`;
     document.getElementById("nameInput").focus();
-    document.getElementById("nameInput").addEventListener("keydown", (e) => { if (e.key === "Enter") startGame(); });
+    document.getElementById("nameInput").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("pinInput").focus(); });
+    document.getElementById("pinInput").addEventListener("keydown", (e) => { if (e.key === "Enter") startGame(); });
     return;
   }
 
@@ -5523,6 +5759,10 @@ function renderBeat() {
     const ending = ENDINGS[currentBeatId];
     app.innerHTML = `
       <div class="header"><h1>BYOA — Predictive Track</h1><span class="fa-badge">PROJECT COMPLETE</span></div>
+      <div class="overall-progress">
+        <div class="overall-progress-track"><div class="overall-progress-fill" style="width: 100%"></div></div>
+        <div class="overall-progress-label">100% through the course</div>
+      </div>
       ${meterBarHTML()}
       <div class="scene ending-panel ${ending.tier}">
         ${imageSlotHTML(ending.imagePrompt, currentBeatId + "::base")}
@@ -5557,6 +5797,7 @@ function renderBeat() {
     app.innerHTML = `
       <div class="header"><h1>BYOA — Predictive Track</h1><span class="fa-badge">${beat.focusArea}</span></div>
       ${breadcrumbHTML(beat.phase)}
+      ${overallProgressBarHTML(beat.phase)}
       ${meterBarHTML()}
       ${trajectoryBannerHTML()}
       <div class="scene narrative-scene">
@@ -5590,6 +5831,7 @@ function renderBeat() {
       app.innerHTML = `
         <div class="header"><h1>BYOA — Predictive Track</h1><span class="fa-badge">${beat.focusArea}</span></div>
         ${breadcrumbHTML(beat.phase)}
+      ${overallProgressBarHTML(beat.phase)}
         ${meterBarHTML()}
         ${trajectoryBannerHTML()}
         <div class="scene form-scene">
@@ -5612,6 +5854,7 @@ function renderBeat() {
     app.innerHTML = `
       <div class="header"><h1>BYOA — Predictive Track</h1><span class="fa-badge">${beat.focusArea}</span></div>
       ${breadcrumbHTML(beat.phase)}
+      ${overallProgressBarHTML(beat.phase)}
       ${meterBarHTML()}
       ${trajectoryBannerHTML()}
       <div class="scene form-scene">
@@ -5649,6 +5892,7 @@ function renderBeat() {
   app.innerHTML = `
     <div class="header"><h1>BYOA — Predictive Track</h1><span class="fa-badge">${beat.focusArea}</span></div>
     ${breadcrumbHTML(beat.phase)}
+      ${overallProgressBarHTML(beat.phase)}
     ${meterBarHTML()}
     ${trajectoryBannerHTML()}
     <div class="scene">
@@ -5676,10 +5920,66 @@ function pickChoiceWrapper(beatId, tier, choiceIndex, choice) {
   pickChoice(choice, beatId, tier, choiceIndex);
 }
 
-function startGame() {
-  const val = document.getElementById("nameInput").value.trim();
-  playerName = val || "Project Manager";
+async function startGame() {
+  const nameVal = document.getElementById("nameInput").value.trim();
+  const pinVal = document.getElementById("pinInput").value.trim();
+
+  if (!pinVal) {
+    document.getElementById("pinInput").focus();
+    document.getElementById("pinInput").placeholder = "PIN required — pick any short code";
+    return;
+  }
+
+  const key = makeStudentKey(nameVal || "player", pinVal);
+  studentKey = key;
+
+  document.getElementById("beginBtn").disabled = true;
+  document.getElementById("loadingNote").style.display = "block";
+
+  const saved = await loadCloudProgress(key);
+
+  if (saved && saved.currentBeatId) {
+    showResumePrompt(nameVal || "Project Manager", saved);
+    return;
+  }
+
+  playerName = nameVal || "Project Manager";
   render();
+  saveCloudProgress();
+}
+
+function showResumePrompt(nameVal, saved) {
+  const app = document.getElementById("app");
+  const decisionsSoFar = (saved.history || []).length;
+  const formsSoFar = Object.keys(saved.formSubmissions || {}).length;
+  app.innerHTML = `
+    <div class="name-gate">
+      <h1>Welcome back, ${nameVal}</h1>
+      <p>We found saved progress under this name and PIN: ${decisionsSoFar} decisions made, ${formsSoFar} documents submitted.</p>
+      <button onclick="resumeFromSave()">Continue where I left off</button>
+      <br><br>
+      <button class="secondary-btn" onclick="startOverFromGate('${nameVal.replace(/'/g, "\\'")}')">Start over instead</button>
+    </div>`;
+  window._pendingResumeSave = saved;
+}
+
+function resumeFromSave() {
+  applyLoadedGameState(window._pendingResumeSave);
+  window._pendingResumeSave = null;
+  render();
+}
+
+async function startOverFromGate(nameVal) {
+  playerName = nameVal || "Project Manager";
+  state = { ...START_STATE };
+  currentBeatId = "N_F1";
+  history = [];
+  decisionLog = [];
+  formSubmissions = {};
+  window._pendingResumeSave = null;
+  await deleteCloudProgress();
+  render();
+  saveCloudProgress();
 }
 
 render();
