@@ -983,7 +983,13 @@ async function saveCloudProgress() {
   }
   cloudSaveInFlight = true;
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}`, {
+    // on_conflict=student_key is required here — student_key is a UNIQUE
+    // column, not the table's primary key (that's the auto-generated `id`
+    // column), and PostgREST's merge-duplicates resolution only matches
+    // against the primary key unless told otherwise. Without this, every
+    // save after the very first one silently fails on the unique
+    // constraint instead of updating the existing row.
+    await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?on_conflict=student_key`, {
       method: "POST",
       headers: {
         "apikey": SUPABASE_ANON_KEY,
